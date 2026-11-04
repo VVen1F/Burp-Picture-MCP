@@ -1,4 +1,4 @@
-# Burp Shot
+# Burp-Picture-MCP
 
 仿 Burp Suite Repeater 的本地发包 + 自动截图小工具。左边粘请求、点发送、右边出响应，**发送后自动把整页渲染成 PNG**，出来的图就是 Burp 那种排版和配色。
 
@@ -77,7 +77,7 @@ Windows 上如果 `python3` 不识别，用 `python burp_shot.py`。
 启动方式（stdio，由客户端拉起）：
 
 ```bash
-python3 /绝对路径/burp-shot/mcp_server.py
+python3 /绝对路径/Burp-Picture-MCP/mcp_server.py
 ```
 
 暴露的工具：
@@ -94,7 +94,7 @@ python3 /绝对路径/burp-shot/mcp_server.py
 ### Claude Code
 
 ```bash
-claude mcp add burp-shot -- python3 /绝对路径/burp-shot/mcp_server.py
+claude mcp add burp-picture -- python3 /绝对路径/Burp-Picture-MCP/mcp_server.py
 ```
 
 ### 通用 mcpServers 配置
@@ -102,19 +102,15 @@ claude mcp add burp-shot -- python3 /绝对路径/burp-shot/mcp_server.py
 ```json
 {
   "mcpServers": {
-    "burp-shot": {
+    "burp-picture": {
       "command": "python3",
-      "args": ["/绝对路径/burp-shot/mcp_server.py"]
+      "args": ["/绝对路径/Burp-Picture-MCP/mcp_server.py"]
     }
   }
 }
 ```
 
 Windows 上把 `python3` 换成 `python`。
-
-### DSH
-
-已写入 `~/.dsh/profiles/web/cordis.patch.yml` 的 `insert` 列表，重启 dsh web 后生效。
 
 ## 已知限制
 
