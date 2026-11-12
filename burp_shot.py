@@ -1,39 +1,41 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Burp Shot —— 一个仿 Burp Repeater 的本地发包 + 自动截图小工具。
+Burp Shot 核心 —— 发原始 HTTP 请求，再用 renderer/shot.html 渲染成
+Burp Repeater 样子的 PNG。
 
-用法:
-    python3 burp_shot.py            # 默认 http://127.0.0.1:8765
-    PORT=9000 python3 burp_shot.py
+mcp_server.py 直接调这里；也可以单独跑一次自检，用自带样例出一张图：
+
+    python3 burp_shot.py
     CHROME=/path/to/chrome python3 burp_shot.py
 
-依赖: 仅标准库；截图复用系统里的 Chrome / Edge（headless），无需 pip 安装。
+依赖：仅标准库。截图复用本机 Chrome / Edge（headless），不需要 pip 安装。
 """
 import os
 import re
-import sys
-import json
-import time
 import gzip
 import zlib
+import json
+import time
 import ssl
 import shutil
-import argparse
+import struct
 import tempfile
-import threading
 import subprocess
-import webbrowser
 import http.client
 import urllib.parse
 from pathlib import Path
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import NamedTuple, Optional
 
 ROOT = Path(__file__).resolve().parent
-UI_FILE = ROOT / "ui.html"
+TEMPLATE = ROOT / "renderer" / "shot.html"
 SHOT_DIR = ROOT / "shots"
 SHOT_DIR.mkdir(exist_ok=True)
-SHOT_WIDTH = 1600
+
+DEFAULT_WIDTH = 1600      # CSS px，截图为 2 倍图
+MIN_HEIGHT = 1200         # 响应短也留出整窗，不然是一条窄图
+MAX_HEIGHT = 3000         # 响应长就截断，不整段铺开
+SCALE = 2
 
 CHROME_CANDIDATES = [
     os.environ.get("CHROME", ""),
@@ -50,6 +52,17 @@ CHROME_CANDIDATES = [
 ]
 
 
+class Reply(NamedTuple):
+    text: str
+    ms: int
+
+
+class Shot(NamedTuple):
+    path: Path
+    width: int
+    height: int
+
+
 def find_chrome():
     for p in CHROME_CANDIDATES:
         if p and os.path.exists(p):
@@ -64,7 +77,8 @@ def find_chrome():
 
 # ---------------------------------------------------------------- 发包
 
-def send_raw(raw: str, scheme: str = "https", timeout: int = 30) -> str:
+def send_timed(raw: str, scheme: str = "https", timeout: int = 30) -> Reply:
+    """发一段原始请求，整体返回 (响应报文, 耗时毫秒)。耗时就是状态栏里那个 millis。"""
     raw = raw.replace("\r\n", "\n").replace("\n", "\r\n")
     if "\r\n\r\n" in raw:
         head, body = raw.split("\r\n\r\n", 1)
@@ -122,6 +136,7 @@ def send_raw(raw: str, scheme: str = "https", timeout: int = 30) -> str:
     else:
         conn = http.client.HTTPConnection(hhost, port, timeout=timeout)
 
+    started = time.perf_counter()
     try:
         conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
         for k, v in headers:
@@ -130,6 +145,7 @@ def send_raw(raw: str, scheme: str = "https", timeout: int = 30) -> str:
         resp = conn.getresponse()
         data = resp.read()
     finally:
+        ms = int(round((time.perf_counter() - started) * 1000))
         conn.close()
 
     enc = (resp.getheader("Content-Encoding") or "").lower()
@@ -158,149 +174,156 @@ def send_raw(raw: str, scheme: str = "https", timeout: int = 30) -> str:
     out = ["HTTP/%d.%d %d %s" % (resp.version // 10, resp.version % 10, resp.status, resp.reason)]
     for k, v in resp.getheaders():
         out.append("%s: %s" % (k, v))
-    return "\r\n".join(out) + "\r\n\r\n" + text
+    return Reply("\r\n".join(out) + "\r\n\r\n" + text, ms)
+
+
+def send_raw(raw: str, scheme: str = "https", timeout: int = 30) -> str:
+    """只要响应报文的老接口。"""
+    return send_timed(raw, scheme, timeout).text
 
 
 # ---------------------------------------------------------------- 截图
 
-def take_shot(request_text: str, response_text: str, width: int = 1600) -> str:
+def _clamp(height: int) -> int:
+    return max(MIN_HEIGHT, min(int(height), MAX_HEIGHT))
+
+
+def _render_page(request_text: str, response_text: str,
+                 ms: Optional[int] = None) -> str:
+    """把数据塞进模板的 /*__PAYLOAD__*/null，返回整页 HTML。"""
+    response_text = response_text or ""
+    payload = json.dumps({
+        "request": request_text or "",
+        "response": response_text,
+        "ms": None if ms is None else max(0, int(round(ms))),
+        "bytes": len(response_text.encode("utf-8")),
+    }, ensure_ascii=False)
+    # </script> 会截断内联脚本
+    data = payload.replace("<", "\\u003c")
+    html = TEMPLATE.read_text(encoding="utf-8")
+    if "/*__PAYLOAD__*/null" not in html:
+        raise RuntimeError("renderer/shot.html 里找不到 /*__PAYLOAD__*/ 注入点")
+    return html.replace("/*__PAYLOAD__*/null", data)
+
+
+def take_shot(request_text: str,
+              response_text: str,
+              width: int = DEFAULT_WIDTH,
+              ms: Optional[int] = None,
+              name: Optional[str] = None) -> Shot:
+    """渲染并截图。第一趟让页面自己报高度，第二趟按这个高度截，不会被裁。"""
     chrome = find_chrome()
     if not chrome:
         raise RuntimeError("未找到 Chrome/Edge，请设置环境变量 CHROME 指向浏览器可执行文件")
+    if not TEMPLATE.exists():
+        raise RuntimeError("找不到模板: %s" % TEMPLATE)
 
-    html = UI_FILE.read_text(encoding="utf-8")
-    data = json.dumps({"request": request_text, "response": response_text},
-                      ensure_ascii=False).replace("<", "\\u003c")
-    html = html.replace("/*__PAYLOAD__*/null", data)
+    response_text = response_text or ""
+    html = _render_page(request_text, response_text, ms)
 
-    name = time.strftime("%Y%m%d-%H%M%S") + ".png"
-    out = SHOT_DIR / name
+    out = SHOT_DIR / (name or time.strftime("%Y%m%d-%H%M%S") + ".png")
 
     with tempfile.TemporaryDirectory() as td:
-        page = Path(td) / "page.html"
+        page = Path(td) / "shot.html"
         page.write_text(html, encoding="utf-8")
-        ud = str(Path(td) / "ud")
         base = [
             chrome, "--headless=new", "--disable-gpu", "--hide-scrollbars",
             "--no-first-run", "--no-default-browser-check", "--disable-extensions",
-            "--force-device-scale-factor=2", "--default-background-color=ffffffff",
-            "--user-data-dir=" + ud,
+            "--force-device-scale-factor=%d" % SCALE,
+            "--default-background-color=ffffffff",
+            "--user-data-dir=" + str(Path(td) / "ud"),
         ]
         url = page.as_uri()
 
-        # 第一趟：让页面自己量出需要多高（换行后行数会变）
-        height = 900
+        # 第一趟：量内容高度（不 fitted，页面按内容撑开）
+        height = MIN_HEIGHT
         try:
-            m = subprocess.run(base + ["--window-size=%d,900" % width, "--dump-dom", url],
-                               timeout=90, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            hit = re.search(r'name="shot-height" content="(\d+)"', m.stdout.decode("utf-8", "replace"))
+            dom = subprocess.run(base + ["--window-size=%d,900" % width, "--dump-dom", url],
+                                 timeout=90, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            hit = re.search(r'name="shot-height" content="(\d+)"',
+                            dom.stdout.decode("utf-8", "replace"))
             if hit:
-                height = max(240, min(int(hit.group(1)), 20000))
+                height = _clamp(hit.group(1))
         except Exception:
             pass
 
-        # 第二趟：按实际高度截图
+        # 第二趟：定高后 fitted 撑满，状态栏贴底
         r = subprocess.run(base + ["--window-size=%d,%d" % (width, height),
-                                   "--screenshot=" + str(out), url],
+                                   "--screenshot=" + str(out), url + "?fitted=1"],
                            timeout=90, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         if not out.exists():
-            raise RuntimeError("Chrome 截图失败: " + (r.stderr.decode("utf-8", "replace")[-400:] or "no output"))
-    return name
+            raise RuntimeError("Chrome 截图失败: " +
+                               (r.stderr.decode("utf-8", "replace")[-400:] or "no output"))
+
+    return Shot(out, width, height)
 
 
-# ---------------------------------------------------------------- HTTP 服务
+def png_size(path) -> tuple:
+    """读 PNG 头里的真实像素尺寸，自检时用来核对 2 倍图。"""
+    with open(path, "rb") as f:
+        head = f.read(24)
+    if head[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("不是 PNG: %s" % path)
+    return struct.unpack(">II", head[16:24])
 
-class Handler(BaseHTTPRequestHandler):
-    server_version = "BurpShot/1.0"
 
-    def log_message(self, fmt, *args):
-        sys.stderr.write("  %s\n" % (fmt % args))
+# ---------------------------------------------------------------- 自检
 
-    def _json(self, obj, code=200):
-        b = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Content-Length", str(len(b)))
-        self.end_headers()
-        self.wfile.write(b)
+DEMO_REQUEST = "\n".join([
+    "POST /api/session/prompt HTTP/1.1",
+    "Host: 100.64.0.101:3000",
+    "Content-Type: application/json",
+    "Accept: */*",
+    "Origin: http://100.64.0.101:3000",
+    "Referer: http://100.64.0.101:3000/",
+    "Accept-Encoding: gzip, deflate, br",
+    "Accept-Language: zh,en;q=0.9,zh-CN;q=0.8",
+    "Connection: keep-alive",
+    "",
+    "{",
+    '    "type": "client-request",',
+    '    "rpcId": "e690fe7e-1f84-42c1-acb7-24c39a7e761c",',
+    '    "method": "session/prompt",',
+    '    "payload": {',
+    '        "args": {',
+    '            "request": {',
+    '                "requestId": "153977e3-75a5-4abd-915f-950936f27516",',
+    '                "sessionId": "session-cae7e24b-baf4-4369-a83c-ce0f29524097",',
+    '                "node": "queue",',
+    '                "content": [',
+    "                    {",
+    '                        "type": "text",',
+    '                        "text": "hello"',
+    "                    }",
+    "                ]",
+    "            }",
+    "        }",
+    "    }",
+    "}",
+])
 
-    def _read_json(self):
-        n = int(self.headers.get("Content-Length") or 0)
-        return json.loads(self.rfile.read(n).decode("utf-8") or "{}")
-
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Max-Age", "86400")
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
-    def do_GET(self):
-        path = urllib.parse.urlsplit(self.path).path
-        if path == "/api/ping":
-            self._json({"ok": True, "app": "burp-shot"})
-        elif path in ("/", "/index.html"):
-            html = UI_FILE.read_text(encoding="utf-8").replace("/*__PAYLOAD__*/null", "null")
-            b = html.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(b)))
-            self.end_headers()
-            self.wfile.write(b)
-        elif path.startswith("/shots/"):
-            f = SHOT_DIR / os.path.basename(path)
-            if f.exists():
-                b = f.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "image/png")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Content-Length", str(len(b)))
-                self.end_headers()
-                self.wfile.write(b)
-            else:
-                self.send_error(404)
-        else:
-            self.send_error(404)
-
-    def do_POST(self):
-        try:
-            p = self._read_json()
-            if self.path == "/api/send":
-                text = send_raw(p.get("raw", ""), p.get("scheme", "https"))
-                self._json({"text": text})
-            elif self.path == "/api/shot":
-                name = take_shot(p.get("request", ""), p.get("response", ""), SHOT_WIDTH)
-                self._json({"file": name, "url": "/shots/" + name})
-            else:
-                self.send_error(404)
-        except Exception as e:
-            self._json({"error": "%s: %s" % (type(e).__name__, e)}, 200)
+DEMO_RESPONSE = "\n".join([
+    "HTTP/1.1 200 OK",
+    "Content-Type: application/json",
+    "Vary: Accept-Encoding",
+    "Date: Thu, 05 Nov 2026 13:12:37 GMT",
+    "Connection: keep-alive",
+    "Keep-Alive: timeout=5",
+    "Content-Length: 120",
+    "",
+    '{"type":"server-response","rpcId":"e690fe7e-1f84-42c1-acb7-24c39a7e761c",'
+    '"result":{"ok":true,"value":{"accepted":true}}}',
+])
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("-p", "--port", type=int, default=int(os.environ.get("PORT", 8765)))
-    ap.add_argument("--no-browser", action="store_true")
-    ap.add_argument("-w", "--width", type=int, default=1600, help="截图宽度(CSS px)，默认 1600，2 倍输出")
-    args = ap.parse_args()
-
-    global SHOT_WIDTH
-    SHOT_WIDTH = args.width
-
-    srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    url = "http://127.0.0.1:%d/" % args.port
-    print("Burp Shot 已启动: %s" % url)
-    print("截图目录: %s" % SHOT_DIR)
-    print("Chrome: %s" % (find_chrome() or "未找到（截图会失败）"))
-    if not args.no_browser:
-        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
-    try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        print("\nbye")
+    chrome = find_chrome()
+    print("Chrome: %s" % (chrome or "未找到（截图会失败）"))
+    print("模板  : %s" % TEMPLATE)
+    shot = take_shot(DEMO_REQUEST, DEMO_RESPONSE, DEFAULT_WIDTH, ms=41)
+    px = png_size(shot.path)
+    print("截图  : %s" % shot.path)
+    print("CSS   : %dx%d  实际像素: %dx%d" % (shot.width, shot.height, px[0], px[1]))
 
 
 if __name__ == "__main__":

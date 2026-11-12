@@ -16,7 +16,7 @@ import traceback
 import burp_shot as core
 
 SERVER_NAME = "burp-shot"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "2.0.0"
 PROTOCOL_FALLBACK = "2024-11-05"
 
 
@@ -49,6 +49,7 @@ TOOLS = [
                 "request": {"type": "string", "description": "请求报文原文"},
                 "response": {"type": "string", "description": "响应报文原文"},
                 "width": {"type": "integer", "default": 1600, "description": "截图宽度（CSS px，输出为 2 倍图）"},
+                "ms": {"type": "integer", "description": "可选：状态栏显示的耗时（毫秒），不传就不显示"},
                 "include_image": {"type": "boolean", "default": False, "description": "是否在返回值里附带 PNG 本身（base64）"}
             },
             "required": ["request", "response"]
@@ -98,22 +99,28 @@ def image_block(path):
 
 def call_tool(name, args):
     if name == "http_send":
-        resp = core.send_raw(args["request"], args.get("scheme", "https"), int(args.get("timeout", 30)))
-        return text_result(resp)
+        reply = core.send_timed(args["request"], args.get("scheme", "https"),
+                                int(args.get("timeout", 30)))
+        return text_result(reply.text)
 
     if name == "http_screenshot":
-        path = core.take_shot(args["request"], args["response"], int(args.get("width", 1600)))
-        full = str((core.SHOT_DIR / path).resolve())
-        blocks = [{"type": "text", "text": "截图已保存: " + full}]
+        shot = core.take_shot(args["request"], args["response"],
+                              int(args.get("width", core.DEFAULT_WIDTH)), args.get("ms"))
+        full = str(shot.path.resolve())
+        blocks = [{"type": "text", "text": "截图已保存: %s (%dx%d)" % (full, shot.width, shot.height)}]
         if args.get("include_image"):
             blocks.append(image_block(full))
         return {"content": blocks, "isError": False}
 
     if name == "http_send_screenshot":
-        resp = core.send_raw(args["request"], args.get("scheme", "https"), int(args.get("timeout", 30)))
-        path = core.take_shot(args["request"], resp, int(args.get("width", 1600)))
-        full = str((core.SHOT_DIR / path).resolve())
-        blocks = [{"type": "text", "text": "截图已保存: " + full + "\n\n--- 响应 ---\n" + resp}]
+        reply = core.send_timed(args["request"], args.get("scheme", "https"),
+                                int(args.get("timeout", 30)))
+        shot = core.take_shot(args["request"], reply.text,
+                              int(args.get("width", core.DEFAULT_WIDTH)), reply.ms)
+        full = str(shot.path.resolve())
+        blocks = [{"type": "text",
+                   "text": "截图已保存: %s (%dx%d)\n\n--- 响应（%d ms）---\n%s"
+                           % (full, shot.width, shot.height, reply.ms, reply.text)}]
         if args.get("include_image"):
             blocks.append(image_block(full))
         return {"content": blocks, "isError": False}

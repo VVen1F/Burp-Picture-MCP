@@ -1,80 +1,53 @@
 # Burp-Picture-MCP
 
-仿 Burp Suite Repeater 的本地发包 + 自动截图小工具。左边粘请求、点发送、右边出响应，**发送后自动把整页渲染成 PNG**，出来的图就是 Burp 那种排版和配色。
+把一段「请求 + 响应」渲染成 Burp Suite Repeater 样子 PNG 的 MCP 服务器。给 AI agent 出
+漏洞报告配图用：调一次工具，拿到一张排版、配色都对得上的截图。
 
-只用 Python 标准库，截图复用本机 Chrome / Edge，不需要 pip 安装任何东西。
+只用 Python 标准库；截图复用本机 Chrome / Edge 的 headless 模式，不用装 Playwright，
+也不用开浏览器。
 
-## 运行
+## 文件
+
+```
+mcp_server.py         MCP stdio 服务，对外 4 个工具
+burp_shot.py          核心：send_timed() 发包、take_shot() 出图
+renderer/shot.html    页面：HTML + CSS + window.render()，唯一的渲染源
+shots/                截图输出目录
+```
+
+`renderer/shot.html` 是独立的：不依赖 Python，浏览器直接打开
+`renderer/shot.html?demo=1` 就能看样例；也可以在自己的项目里调
+
+```js
+window.render({ request, response, ms, bytes });
+```
+
+## 出图是什么样
+
+- 宽度 1600 CSS px，2 倍图（PNG 实际 3200 px 宽），和真 Burp 在 2x 屏上截的一致。
+- 高度按内容量出来，下限 1200、上限 3000 CSS px：短响应不留一条窄图，超长 body 也
+  不整段铺开（和真窗口一样，超出部分在窗口里可滚动）。
+- 标题 44px、页签 30px、代码区 Menlo 12px / 行高 14.5px、底栏 44px、状态栏 28px。
+- 左右 Request / Response 两栏；右栏 Inspector / Notes / Explanations / Custom actions。
+- 状态栏：左边 `Done` / `Ready`，右边 `N bytes | M millis`（毫秒是真实发包耗时）。
+- 语法高亮照 Burp：头名称藏青、Cookie 值暗红、JSON 键藏青、字符串绿、数字和 true/false 亮蓝。
+- Pretty 视图把 JSON 排成 4 空格缩进；长行自动换行，续行不重复行号。
+
+## 单独试一下
 
 ```bash
 python3 burp_shot.py
+# Chrome: /usr/bin/google-chrome
+# 模板  : .../renderer/shot.html
+# 截图  : .../shots/20261111-223955.png
+# CSS   : 1600x1200  实际像素: 3200x2400
 ```
 
-浏览器自动打开 `http://127.0.0.1:8765/`。
+`CHROME=/path/to/chrome python3 burp_shot.py` 可以手动指定浏览器。
 
-常用参数：
+## 作为 MCP 工具接入
 
-```bash
-python3 burp_shot.py -p 9000          # 换端口
-python3 burp_shot.py -w 1400          # 截图宽度（CSS px，默认 1600，输出为 2 倍图）
-CHROME=/path/to/chrome python3 burp_shot.py   # 手动指定浏览器
-python3 burp_shot.py --no-browser     # 不自动开浏览器
-```
-
-Windows 上如果 `python3` 不识别，用 `python burp_shot.py`。
-
-也可以直接双击 `ui.html` 打开（编辑器内置预览也行）——只要服务在跑，页面会自动回退到
-`http://127.0.0.1:8765/` 发请求。服务没起来时页面顶部会出现黄条提示，不会只丢一个 fetch 报错。
-
-## 用法
-
-1. 左边 Request 区整段粘请求包（含请求行和 Host），粘贴时就会跟着语法上色，不用等发送。
-2. 顶部选 `http` 或 `https`（决定用什么协议连 Host）。
-3. 点「发送」或者 `Ctrl/Cmd + Enter`。
-4. 右边出现响应，同时自动存图到 `shots/YYYYMMDD-HHMMSS.png`，底部会给出链接。
-5. 想对当前内容重新出图，点「截图」。
-
-勾掉「发送后自动截图」就只发包不存图。
-
-## 和 Burp 的对应关系
-
-| Burp | 这里 |
-|---|---|
-| 左 Request / 右 Response 分栏 | 一样 |
-| Pretty / Raw / Hex / Render / Chinese 标签 | 位置、字号、颜色一样（标签本身不切换视图） |
-| 长行自动换行（Cookie、长 URL、body 都一样） | 一样 |
-| 换行后继续行不重复行号，只标在逻辑行 | 一样 |
-| 行号栏、底部 ? / 齿轮 / 前后翻页 / 搜索框 | 一样 |
-| 右上角四个图标（隐藏、换行、回车、菜单） | 一样 |
-| 头名称藏青、Cookie 值暗红、JSON 键藏青、字符串绿、数字亮蓝 | 一样 |
-| 纯黑等宽正文字体 | 一样 |
-
-截图是该页面本身在 headless Chrome 里的渲染结果，所以**所见即所得**，不存在 html2canvas 那种偏差。
-
-## 微调配色和字体
-
-全部在 `ui.html` 顶部的 `:root` 里：
-
-```css
---fs:13px;        /* 编辑器字号 */
---lh:20px;        /* 行高 */
---fg:#212121;     /* 正文黑 */
---hn:#000080;     /* 头名称 / JSON 键：藏青 */
---num:#0000cc;    /* JSON 数字、true/false：亮蓝 */
---cv:#800000;     /* Cookie 值：暗红 */
---str:#008000;    /* JSON 字符串值：绿 */
---acc:#d9612d;    /* 当前标签页的橙色下划线 */
---mono:"Consolas","Menlo","DejaVu Sans Mono",...;  /* 等宽字体栈 */
-```
-
-想让图更像你本机的 Burp，把 `--mono` 改成你 Burp 里设置的那款字体（Burp: User options → Display → Font），字号行高跟着调一格即可。
-
-
-## 作为 MCP 工具给 AI agent 调用
-
-`mcp_server.py` 把发包和截图暴露成 MCP 工具，agent 可以直接调用，不用开浏览器。
-
-启动方式（stdio，由客户端拉起）：
+stdio，由客户端拉起：
 
 ```bash
 python3 /绝对路径/Burp-Picture-MCP/mcp_server.py
@@ -85,11 +58,11 @@ python3 /绝对路径/Burp-Picture-MCP/mcp_server.py
 | 工具 | 作用 | 主要参数 |
 |---|---|---|
 | `http_send` | 发原始 HTTP 请求，返回完整响应 | `request`、`scheme`、`timeout` |
-| `http_screenshot` | 把请求/响应渲染成 Burp 风格 PNG | `request`、`response`、`width`、`include_image` |
-| `http_send_screenshot` | 发包 + 截图一步完成（推荐） | `request`、`scheme`、`include_image` |
+| `http_screenshot` | 把已有的请求/响应渲染成 PNG | `request`、`response`、`width`、`ms`、`include_image` |
+| `http_send_screenshot` | 发包 + 截图一步完成（推荐） | `request`、`scheme`、`timeout`、`width`、`include_image` |
 | `shot_list` | 列出最近截图 | `limit` |
 
-`include_image: true` 时会在返回值里附带 PNG 本身（base64），让 agent 能直接看到图。
+`include_image: true` 时返回值里会附带 PNG 本身（base64），agent 能直接看图。
 
 ### Claude Code
 
@@ -112,11 +85,26 @@ claude mcp add burp-picture -- python3 /绝对路径/Burp-Picture-MCP/mcp_server
 
 Windows 上把 `python3` 换成 `python`。
 
+## 改配色、字体
+
+全在 `renderer/shot.html` 里，没有编译步骤：
+
+- 字号行高：`.code` 的 `font: 12px/14.5px ...`
+- 各块高度：`.title` 44px、`.tabs` 30px、`.pane-tools` 44px、`.status` 28px
+- 颜色：`.hn`（头名称 / JSON 键）、`.cv`（Cookie 值）、`.js`（字符串）、`.jn`（数字）、
+  `.tab.on::after`（页签下的橙线 `#c4663f`）
+- 字体栈：`.code` 里 `Menlo, Consolas, "SF Mono", "DejaVu Sans Mono", monospace`，换成你
+  Burp 里设置的那款（Burp: Settings → User interface → Font）即可
+
+改完直接 `python3 burp_shot.py` 看效果。
+
 ## 已知限制
 
 - 只支持 HTTP/1.1，没有 HTTP/2 和 WebSocket。
 - 响应只解 gzip / deflate；`br` 需要额外装 brotli，没装就显示原始字节。
 - 不会自动跟随重定向（和 Repeater 行为一致）。
-- 没有代理链；要走 Burp 上游代理需要自己加（`http.client` 的 `set_tunnel`）。
-- 截图高度是两趟算出来的：先让页面自己报高度（换行会改变行数），再按这个高度截，所以不会被裁。
-- 换行点偶尔和 Burp 差一点：Burp 会把长 token 的首段填满当前行再换行，CSS 的 `overflow-wrap:anywhere` 会先把整个 token 挪到下一行再拆。
+- 没有代理链；要走上游代理需要自己给 `http.client` 加 `set_tunnel`。
+- 高度是两趟算出来的：先让页面自己报高度（换行会改变行数），再按这个高度截，所以
+  不会被裁；超过 3000 CSS px 的部分按窗口行为截断。
+- 换行点偶尔和 Burp 差一点：Burp 会把长 token 的首段填满当前行再换行，CSS 的
+  `overflow-wrap: anywhere` 会先把整个 token 挪到下一行再拆。
